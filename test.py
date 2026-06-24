@@ -147,7 +147,7 @@ def main(cfg: DictConfig):
         with torch.no_grad():
             restored = 0
             for name, param in model.model.named_parameters():
-                if name in ema_shadow:
+                if name in ema_shadow and ema_shadow[name].shape == param.shape:
                     param.data.copy_(ema_shadow[name].to(param.device, param.dtype))
                     restored += 1
         print(f"Found EMA shadow weights in checkpoint -- evaluating with EMA-averaged "
