@@ -392,37 +392,45 @@ class ActivePrecisionGate(nn.Module):
         return R + F.silu(agree)
 
 
+def _parallel_scan(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    Parallel prefix scan for the first-order linear recurrence
+    h_t = a_t * h_{t-1} + b_t,  h_{-1} = 0.
+
+    Uses the associative operator (a1,b1) x (a2,b2) = (a2*a1, a2*b1+b2)
+    and a doubling strategy: stride 1, 2, 4, ... until stride >= T.
+    Each doubling step is one pair of vectorized PyTorch ops -- no Python
+    loop over T. Total: ceil(log2(T)) steps ~ 9 for T=300.
+
+    a, b: [B, T, D]  (a values should be in (0,1) for stability)
+    returns: [B, T, D] the hidden state sequence h_1 ... h_T
+    """
+    stride = 1
+    while stride < a.shape[1]:
+        a_prev = F.pad(a[:, :-stride], (0, 0, stride, 0), value=1.0)
+        b_prev = F.pad(b[:, :-stride], (0, 0, stride, 0), value=0.0)
+        new_a  = a * a_prev
+        new_b  = a * b_prev + b
+        a, b   = new_a, new_b
+        stride <<= 1
+    return b
+
+
 class ContextGatedRecurrence(nn.Module):
     """
-    Linear-time selective recurrent scan.
+    Selective recurrent scan with parallel-scan forward pass.
 
     h_t = (1 - pi_t) * h_{t-1} + pi_t * x_t
     pi_t = sigmoid( beta * x_t * C_t )
 
-    Temporal extension of the ActivePrecisionGate modulation into the
-    sequence dimension. Where ActivePrecisionGate asks "do R and C agree
-    at THIS timestep?", ContextGatedRecurrence asks "does the current
-    input agree with context strongly enough to UPDATE the running hidden
-    state?". When pi_t -> 1, the hidden state snaps toward x_t (the
-    current frame dominates). When pi_t -> 0, the previous hidden state
-    is carried forward unchanged (historical context dominates). This
-    gives an adaptive, unbounded effective receptive field -- the
-    property a fixed-kernel Conv1d cannot provide regardless of kernel
-    width -- while remaining O(T) and attention-free.
+    Same recurrence as before; the Python loop over T has been replaced
+    with _parallel_scan above, which uses ceil(log2(T)) vectorized
+    PyTorch ops instead of T sequential Python iterations. For T=300
+    this is ~9 kernel launches vs ~900, eliminating the per-step Python
+    overhead that was causing the slowdown in version_33.
 
-    Parameter cost: one per-channel scalar beta (d params) plus one
-    Linear(d, d) + Tanh for the context projection (d^2 + d params).
-    Same minimal philosophy as ActivePrecisionGate.
-
-    Context C is projected to [-1, 1] via Tanh before the gate is
-    computed, bounding the pi_t computation the same way the context
-    generators in DualPopModulationLayer do.
-
-    Note: the forward runs a sequential scan in Python over T. This is
-    correct and O(T) but slower wall-clock than a fused CUDA kernel for
-    very long sequences. For AVSEC-4 at hop=160 and typical utterance
-    lengths, T is a few hundred frames -- manageable without a custom
-    kernel at research scale.
+    Parameter cost and semantics are unchanged: one per-channel scalar
+    beta plus one Linear(d,d)+Tanh for the context projection.
     """
 
     def __init__(self, d: int):
@@ -438,15 +446,9 @@ class ContextGatedRecurrence(nn.Module):
         Returns:
             [B, T, D] recurrent hidden state sequence
         """
-        B, T, D = x.shape
-        C_proj = self.context(C)    # [B, T, D], values in [-1, 1]
-        h      = x.new_zeros(B, D) # initial hidden state
-        outs   = []
-        for t in range(T):
-            pi_t = torch.sigmoid(self.beta * x[:, t] * C_proj[:, t])
-            h    = (1.0 - pi_t) * h + pi_t * x[:, t]
-            outs.append(h)
-        return torch.stack(outs, dim=1)  # [B, T, D]
+        C_proj = self.context(C)                    # [B, T, D], in [-1, 1]
+        pi     = torch.sigmoid(self.beta * x * C_proj)  # [B, T, D]
+        return _parallel_scan(1.0 - pi, pi * x)
 
 
 class PrecisionCooperationGate(nn.Module):
