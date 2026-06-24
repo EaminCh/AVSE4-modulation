@@ -98,71 +98,51 @@ def main(cfg: DictConfig):
         raise RuntimeError("Select one of dev set and test set")
 
     # ==============================================================================
-    # DYNAMIC CHECKPOINT WEIGHT ALIGNMENT FOR NEW ARCHITECTURE
+    # CHECKPOINT LOADING WITH ARCHITECTURE MISMATCH HANDLING
+    #
+    # strict=False in PyTorch/Lightning skips missing/extra keys but still
+    # raises RuntimeError on shape mismatches. A checkpoint trained with an
+    # older architecture (e.g. Linear d->d instead of d->2d in the transforms)
+    # will crash even with strict=False. Fix: instantiate a fresh model to
+    # get the current architecture's shapes, filter the checkpoint to only
+    # shape-compatible keys, and load with strict=False so mismatched keys
+    # fall back to random initialisation. EMA shadow is pulled directly from
+    # the checkpoint dict rather than via the Lightning hook.
     # ==============================================================================
     import os
 
-    print(f"[*] Extracting and matching state dict from: {cfg.ckpt_path}")
+    print(f"[*] Loading checkpoint: {cfg.ckpt_path}")
     checkpoint = torch.load(cfg.ckpt_path, map_location="cpu")
     old_state_dict = checkpoint["state_dict"]
-    
-    # Instantiate a temporary baseline module with strict=False to capture target keys
-    base_model = AVSE4BaselineModule.load_from_checkpoint(cfg.ckpt_path, strict=False)
-    target_keys = base_model.state_dict().keys()
-    
-    remapped_state_dict = {}
-    
-    # Direct matching logic to correct inversion mismatches between old metrics and new parameters
-    for key, value in old_state_dict.items():
-        new_key = key
-        
-        # 1. Map Checkpoint Projections (_proj) -> Code Transforms (_transform)
-        new_key = new_key.replace("audio_proj.0", "audio_transform.0")
-        new_key = new_key.replace("audio_proj.1", "audio_transform.1")
-        new_key = new_key.replace("video_proj.0", "video_transform.0")
-        new_key = new_key.replace("video_proj.1", "video_transform.1")
-        
-        # 2. Map Checkpoint Gates (_gate.gate) -> Code Context Gens (_context_gen.0)
-        new_key = new_key.replace("audio_gate.gate", "audio_context_gen.0")
-        new_key = new_key.replace("video_gate.gate", "video_context_gen.0")
-        new_key = new_key.replace("cross_gate.gate", "cross_context_gen.0")
-        
-        # 3. Handle secondary sub-layers shifting indices to normalization transforms (.3)
-        new_key = new_key.replace("audio_context_gen.1", "audio_transform.3")
-        new_key = new_key.replace("video_context_gen.1", "video_transform.3")
-        new_key = new_key.replace("cross_context_gen.1", "cross_context_gen.0") 
-        
-        remapped_state_dict[new_key] = value
 
-    # 4. Programmatically fill missing Cooperation Precision layers with neutral ones/zeros
-    for target_key in target_keys:
-        if target_key not in remapped_state_dict:
-            print(f"    [!] Generating safe weights for new submodule layer: {target_key}")
-            dummy_tensor = base_model.state_dict()[target_key]
-            if "weight" in target_key and dummy_tensor.dim() > 0:
-                remapped_state_dict[target_key] = torch.ones_like(dummy_tensor)
-            else:
-                remapped_state_dict[target_key] = torch.zeros_like(dummy_tensor)
+    # Fresh instantiation gives us the current architecture's parameter shapes
+    # without attempting to load incompatible weights.
+    model = AVSE4BaselineModule()
+    target_state = model.state_dict()
 
-    # Filter out extraneous unmapped configuration tags
-    final_state_dict = {k: v for k, v in remapped_state_dict.items() if k in target_keys}
+    matched, skipped = {}, []
+    for k, v in old_state_dict.items():
+        if k in target_state and target_state[k].shape == v.shape:
+            matched[k] = v
+        else:
+            ckpt_shape  = tuple(v.shape)
+            model_shape = tuple(target_state[k].shape) if k in target_state else "missing"
+            skipped.append(f"  {k}: ckpt {ckpt_shape} vs model {model_shape}")
 
-    # Inject the aligned states back into the configuration dictionary
-    checkpoint["state_dict"] = final_state_dict
-    temp_ckpt_path = cfg.ckpt_path + ".aligned.tmp"
-    torch.save(checkpoint, temp_ckpt_path)
-    
-    print("[*] Ingesting cleanly mapped state matrix with strict structural verification...")
-    model = AVSE4BaselineModule.load_from_checkpoint(temp_ckpt_path, strict=True)
-    
-    # Safely clear temp tracking files from cluster disk
-    if os.path.exists(temp_ckpt_path):
-        os.remove(temp_ckpt_path)
-        
-    print(f"[SUCCESS] Aligned model successfully mounted for evaluation: {cfg.ckpt_path}")
-    # ==============================================================================
+    if skipped:
+        print(f"[!] {len(skipped)} keys skipped (shape mismatch or not in current arch):")
+        for s in skipped:
+            print(s)
 
-    ema_shadow = getattr(model, "_loaded_ema_shadow", None)
+    load_result = model.load_state_dict(matched, strict=False)
+    print(f"[*] Loaded {len(matched)} matched keys. "
+          f"Random-init fallback: {len(load_result.missing_keys)} keys.")
+    print(f"[SUCCESS] Model loaded from: {cfg.ckpt_path}")
+
+    # Pull EMA shadow directly from the checkpoint dict (bypassing the
+    # on_load_checkpoint Lightning hook which only fires during
+    # load_from_checkpoint).
+    ema_shadow = checkpoint.get("ema_shadow", None)
     if USE_EMA_WEIGHTS and ema_shadow is not None:
         with torch.no_grad():
             restored = 0
